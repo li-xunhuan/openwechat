@@ -41,39 +41,55 @@ type Client struct {
 	HttpHooks HttpHooks
 	*http.Client
 	Domain  WechatDomain
-	mode    mode
+	mode    Mode
 	mu      sync.Mutex
 	cookies map[string][]*http.Cookie
 }
 
-func NewClient(client *http.Client) *Client {
-	return &Client{Client: client}
+func NewClient() *Client {
+	jar, _ := cookiejar.New(nil)
+	timeout := 30 * time.Second
+	return &Client{
+		Client: &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			Jar:     jar,
+			Timeout: timeout,
+		}}
 }
 
 // DefaultClient 自动存储cookie
 // 设置客户端不自动跳转
 func DefaultClient() *Client {
-	jar, _ := cookiejar.New(nil)
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Jar: jar,
-	}
-	c := NewClient(client)
-	c.AddHttpHook(UserAgentHook{})
-	return c
+	client := NewClient()
+	client.AddHttpHook(UserAgentHook{})
+	return client
 }
 
 func (c *Client) AddHttpHook(hooks ...HttpHook) {
 	c.HttpHooks = append(c.HttpHooks, hooks...)
 }
 
+const maxRetry = 2
+
 func (c *Client) do(req *http.Request) (*http.Response, error) {
 	for _, hook := range c.HttpHooks {
 		hook.BeforeRequest(req)
 	}
-	resp, err := c.Client.Do(req)
+	var (
+		resp *http.Response
+		err  error
+	)
+	for i := 0; i < maxRetry; i++ {
+		resp, err = c.Client.Do(req)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		err = fmt.Errorf("%w: %s", NetworkErr, err.Error())
+	}
 	for _, hook := range c.HttpHooks {
 		hook.AfterRequest(resp, err)
 	}
@@ -108,22 +124,7 @@ func (c *Client) GetCookieMap() map[string][]*http.Cookie {
 
 // GetLoginUUID 获取登录的uuid
 func (c *Client) GetLoginUUID() (*http.Response, error) {
-	path, _ := url.Parse(jslogin)
-	params := url.Values{}
-	redirectUrl, _ := url.Parse(webwxnewloginpage)
-	if c.mode == Desktop {
-		p := url.Values{"mod": {"desktop"}}
-		redirectUrl.RawQuery = p.Encode()
-	}
-	params.Add("redirect_uri", redirectUrl.String())
-	params.Add("appid", appId)
-	params.Add("fun", "new")
-	params.Add("lang", "zh_CN")
-	params.Add("_", strconv.FormatInt(time.Now().Unix(), 10))
-
-	path.RawQuery = params.Encode()
-	req, _ := http.NewRequest(http.MethodGet, path.String(), nil)
-	return c.Do(req)
+	return c.mode.GetLoginUUID(c)
 }
 
 // GetLoginQrcode 获取登录的二维吗
@@ -149,12 +150,7 @@ func (c *Client) CheckLogin(uuid string) (*http.Response, error) {
 
 // GetLoginInfo 请求获取LoginInfo
 func (c *Client) GetLoginInfo(path string) (*http.Response, error) {
-	req, _ := http.NewRequest(http.MethodGet, path, nil)
-	if c.mode == Desktop {
-		req.Header.Add("client-version", uosPatchClientVersion)
-		req.Header.Add("extspam", uosPatchExtspam)
-	}
-	return c.Do(req)
+	return c.mode.GetLoginInfo(c, path)
 }
 
 // WebInit 请求获取初始化信息
@@ -195,15 +191,15 @@ func (c *Client) WebWxStatusNotify(request *BaseRequest, response *WebInitRespon
 }
 
 // SyncCheck 异步检查是否有新的消息返回
-func (c *Client) SyncCheck(info *LoginInfo, response *WebInitResponse) (*http.Response, error) {
+func (c *Client) SyncCheck(request *BaseRequest, info *LoginInfo, response *WebInitResponse) (*http.Response, error) {
 	path, _ := url.Parse(c.Domain.SyncHost() + synccheck)
 	params := url.Values{}
-	params.Add("r", strconv.FormatInt(time.Now().Unix(), 10))
+	params.Add("r", strconv.FormatInt(time.Now().UnixNano()/1e6, 10))
 	params.Add("skey", info.SKey)
 	params.Add("sid", info.WxSid)
-	params.Add("uin", strconv.Itoa(info.WxUin))
-	params.Add("deviceid", GetRandomDeviceId())
-	params.Add("_", strconv.FormatInt(time.Now().Unix(), 10))
+	params.Add("uin", strconv.FormatInt(info.WxUin, 10))
+	params.Add("deviceid", request.DeviceID)
+	params.Add("_", strconv.FormatInt(time.Now().UnixNano()/1e6, 10))
 	var syncKeyStringSlice = make([]string, response.SyncKey.Count)
 	// 将SyncKey里面的元素按照特定的格式拼接起来
 	for index, item := range response.SyncKey.List {
@@ -221,7 +217,7 @@ func (c *Client) SyncCheck(info *LoginInfo, response *WebInitResponse) (*http.Re
 func (c *Client) WebWxGetContact(info *LoginInfo) (*http.Response, error) {
 	path, _ := url.Parse(c.Domain.BaseHost() + webwxgetcontact)
 	params := url.Values{}
-	params.Add("r", strconv.FormatInt(time.Now().Unix(), 10))
+	params.Add("r", strconv.FormatInt(time.Now().UnixNano()/1e6, 10))
 	params.Add("skey", info.SKey)
 	params.Add("req", "0")
 	path.RawQuery = params.Encode()
@@ -234,7 +230,7 @@ func (c *Client) WebWxBatchGetContact(members Members, request *BaseRequest) (*h
 	path, _ := url.Parse(c.Domain.BaseHost() + webwxbatchgetcontact)
 	params := url.Values{}
 	params.Add("type", "ex")
-	params.Add("r", strconv.FormatInt(time.Now().Unix(), 10))
+	params.Add("r", strconv.FormatInt(time.Now().UnixNano()/1e6, 10))
 	path.RawQuery = params.Encode()
 	list := NewUserDetailItemList(members)
 	content := map[string]interface{}{
@@ -302,6 +298,8 @@ func (c *Client) WebWxGetHeadImg(user *User) (*http.Response, error) {
 		params.Add("username", user.UserName)
 		params.Add("skey", user.Self.Bot.Storage.Request.Skey)
 		params.Add("type", "big")
+		params.Add("chatroomid", user.EncryChatRoomId)
+		params.Add("seq", "0")
 		URL, _ := url.Parse(c.Domain.BaseHost() + webwxgeticon)
 		URL.RawQuery = params.Encode()
 		path = URL.String()
@@ -402,18 +400,16 @@ func (c *Client) WebWxUploadMediaByChunk(file *os.File, request *BaseRequest, in
 	// 分块上传
 	for chunk := 0; int64(chunk) < chunks; chunk++ {
 
-		var isLastTime bool
-		if int64(chunk)+1 == chunks {
-			isLastTime = true
-		}
+		isLastTime := int64(chunk)+1 == chunks
 
 		if chunks > 1 {
 			content["chunk"] = strconv.Itoa(chunk)
 		}
 
-		var formBuffer bytes.Buffer
+		var formBuffer = bytes.NewBuffer(nil)
 
-		writer := multipart.NewWriter(&formBuffer)
+		writer := multipart.NewWriter(formBuffer)
+
 		if err = writer.WriteField("uploadmediarequest", string(uploadMediaRequestByte)); err != nil {
 			return nil, err
 		}
@@ -424,22 +420,29 @@ func (c *Client) WebWxUploadMediaByChunk(file *os.File, request *BaseRequest, in
 			}
 		}
 
-		if w, err := writer.CreateFormFile("filename", file.Name()); err != nil {
+		w, err := writer.CreateFormFile("filename", file.Name())
+
+		if err != nil {
 			return nil, err
-		} else {
-			chunkData := make([]byte, chunkSize)
-			if _, err := file.Read(chunkData); err != nil && err != io.EOF {
-				return nil, err
-			}
-			if _, err = w.Write(chunkData); err != nil {
-				return nil, err
-			}
 		}
+
+		chunkData := make([]byte, chunkSize)
+
+		n, err := file.Read(chunkData)
+
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+
+		if _, err = w.Write(chunkData[:n]); err != nil {
+			return nil, err
+		}
+
 		ct := writer.FormDataContentType()
 		if err = writer.Close(); err != nil {
 			return nil, err
 		}
-		req, _ := http.NewRequest(http.MethodPost, path.String(), &formBuffer)
+		req, _ := http.NewRequest(http.MethodPost, path.String(), formBuffer)
 		req.Header.Set("Content-Type", ct)
 		// 发送数据
 		resp, err = c.Do(req)
@@ -448,7 +451,12 @@ func (c *Client) WebWxUploadMediaByChunk(file *os.File, request *BaseRequest, in
 		}
 		// 如果不是最后一次, 解析有没有错误
 		if !isLastTime {
-			if err := parseBaseResponseError(resp); err != nil {
+			parser := MessageResponseParser{Reader: resp.Body}
+			if err = parser.Err(); err != nil {
+				_ = resp.Body.Close()
+				return nil, err
+			}
+			if err = resp.Body.Close(); err != nil {
 				return nil, err
 			}
 		}
@@ -506,7 +514,7 @@ func (c *Client) WebWxVerifyUser(storage *Storage, info RecommendInfo, verifyCon
 	loginInfo := storage.LoginInfo
 	path, _ := url.Parse(c.Domain.BaseHost() + webwxverifyuser)
 	params := url.Values{}
-	params.Add("r", strconv.FormatInt(time.Now().Unix(), 10))
+	params.Add("r", strconv.FormatInt(time.Now().UnixNano()/1e6, 10))
 	params.Add("lang", "zh_CN")
 	params.Add("pass_ticket", loginInfo.PassTicket)
 	path.RawQuery = params.Encode()

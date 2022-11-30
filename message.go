@@ -2,21 +2,22 @@ package openwechat
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 )
 
 type Message struct {
-	IsAt    bool
+	isAt    bool
 	AppInfo struct {
 		Type  int
 		AppID string
@@ -49,10 +50,12 @@ type Message struct {
 	Url                   string
 	senderInGroupUserName string
 	RecommendInfo         RecommendInfo
-	Bot                   *Bot
+	Bot                   *Bot `json:"-"`
 	mu                    sync.RWMutex
-	Context               context.Context
+	Context               context.Context `json:"-"`
 	item                  map[string]interface{}
+	Raw                   []byte `json:"-"`
+	RawContent            string `json:"-"` // 消息原始内容
 }
 
 // Sender 获取消息的发送者
@@ -86,6 +89,9 @@ func (m *Message) SenderInGroup() (*User, error) {
 	if err := group.Detail(); err != nil {
 		return nil, err
 	}
+	if group.IsFriend() {
+		return group, nil
+	}
 	users := group.MemberList.SearchByUserName(1, m.senderInGroupUserName)
 	if users == nil {
 		return nil, ErrNoSuchUserFoundError
@@ -95,23 +101,37 @@ func (m *Message) SenderInGroup() (*User, error) {
 }
 
 // Receiver 获取消息的接收者
+// 如果消息是群组消息，则返回群组
+// 如果消息是好友消息，则返回好友
+// 如果消息是系统消息，则返回当前用户
 func (m *Message) Receiver() (*User, error) {
+	if m.IsSystem() || m.ToUserName == m.Bot.self.UserName {
+		return m.Bot.self.User, nil
+	}
+	// https://github.com/eatmoreapple/openwechat/issues/113
+	if m.ToUserName == m.Bot.self.fileHelper.UserName {
+		return m.Bot.self.fileHelper.User, nil
+	}
 	if m.IsSendByGroup() {
-		if sender, err := m.Sender(); err != nil {
+		groups, err := m.Bot.self.Groups()
+		if err != nil {
 			return nil, err
-		} else {
-			users := sender.MemberList.SearchByUserName(1, m.ToUserName)
-			if users == nil {
-				return nil, ErrNoSuchUserFoundError
-			}
-			return users.First(), nil
 		}
-	} else {
-		users := m.Bot.self.MemberList.SearchByUserName(1, m.ToUserName)
-		if users == nil {
+		username := m.FromUserName
+		if m.IsSendBySelf() {
+			username = m.ToUserName
+		}
+		users := groups.SearchByUserName(1, username)
+		if users.Count() == 0 {
 			return nil, ErrNoSuchUserFoundError
 		}
-		return users.First(), nil
+		return users.First().User, nil
+	} else {
+		user, exist := m.Bot.self.MemberList.GetByRemarkName(m.ToUserName)
+		if !exist {
+			return nil, ErrNoSuchUserFoundError
+		}
+		return user, nil
 	}
 }
 
@@ -127,47 +147,60 @@ func (m *Message) IsSendByFriend() bool {
 
 // IsSendByGroup 判断消息是否由群组发送
 func (m *Message) IsSendByGroup() bool {
-	return strings.HasPrefix(m.FromUserName, "@@")
-}
-
-// Reply 回复消息
-func (m *Message) Reply(msgType MessageType, content, mediaId string) (*SentMessage, error) {
-	msg := NewSendMessage(msgType, content, m.Bot.self.User.UserName, m.FromUserName, mediaId)
-	info := m.Bot.Storage.LoginInfo
-	request := m.Bot.Storage.Request
-	sentMessage, err := m.Bot.Caller.WebWxSendMsg(msg, info, request)
-	if err != nil {
-		return nil, err
-	}
-	sentMessage.Self = m.Bot.self
-	return sentMessage, nil
+	return strings.HasPrefix(m.FromUserName, "@@") || (m.IsSendBySelf() && strings.HasPrefix(m.ToUserName, "@@"))
 }
 
 // ReplyText 回复文本消息
 func (m *Message) ReplyText(content string) (*SentMessage, error) {
-	return m.Reply(MsgTypeText, content, "")
+	msg := NewSendMessage(MsgTypeText, content, m.Bot.self.User.UserName, m.FromUserName, "")
+	info := m.Bot.Storage.LoginInfo
+	request := m.Bot.Storage.Request
+	sentMessage, err := m.Bot.Caller.WebWxSendMsg(msg, info, request)
+	return m.Bot.self.sendMessageWrapper(sentMessage, err)
 }
 
 // ReplyImage 回复图片消息
 func (m *Message) ReplyImage(file *os.File) (*SentMessage, error) {
 	info := m.Bot.Storage.LoginInfo
 	request := m.Bot.Storage.Request
-	return m.Bot.Caller.WebWxSendImageMsg(file, request, info, m.Bot.self.UserName, m.FromUserName)
+	sentMessage, err := m.Bot.Caller.WebWxSendImageMsg(file, request, info, m.Bot.self.UserName, m.FromUserName)
+	return m.Bot.self.sendMessageWrapper(sentMessage, err)
+}
+
+// ReplyVideo 回复视频消息
+func (m *Message) ReplyVideo(file *os.File) (*SentMessage, error) {
+	info := m.Bot.Storage.LoginInfo
+	request := m.Bot.Storage.Request
+	sentMessage, err := m.Bot.Caller.WebWxSendVideoMsg(file, request, info, m.Bot.self.UserName, m.FromUserName)
+	return m.Bot.self.sendMessageWrapper(sentMessage, err)
 }
 
 // ReplyFile 回复文件消息
 func (m *Message) ReplyFile(file *os.File) (*SentMessage, error) {
 	info := m.Bot.Storage.LoginInfo
 	request := m.Bot.Storage.Request
-	return m.Bot.Caller.WebWxSendFile(file, request, info, m.Bot.self.UserName, m.FromUserName)
+	sentMessage, err := m.Bot.Caller.WebWxSendFile(file, request, info, m.Bot.self.UserName, m.FromUserName)
+	return m.Bot.self.sendMessageWrapper(sentMessage, err)
 }
 
 func (m *Message) IsText() bool {
 	return m.MsgType == MsgTypeText && m.Url == ""
 }
 
-func (m *Message) IsMap() bool {
-	return m.MsgType == MsgTypeText && m.Url != ""
+func (m *Message) IsLocation() bool {
+	return m.MsgType == MsgTypeText && strings.Contains(m.Url, "api.map.qq.com") && strings.Contains(m.Content, "pictype=location")
+}
+
+func (m *Message) IsRealtimeLocation() bool {
+	return m.IsRealtimeLocationStart() || m.IsRealtimeLocationStop()
+}
+
+func (m *Message) IsRealtimeLocationStart() bool {
+	return m.MsgType == MsgTypeApp && m.AppMsgType == AppMsgTypeRealtimeShareLocation
+}
+
+func (m *Message) IsRealtimeLocationStop() bool {
+	return m.MsgType == MsgTypeSys && m.Content == "位置共享已经结束"
 }
 
 func (m *Message) IsPicture() bool {
@@ -227,6 +260,11 @@ func (m *Message) IsReceiveRedPacket() bool {
 	return m.IsSystem() && m.Content == "收到红包，请在手机上查看"
 }
 
+// IsRenameGroup 判断当前是否是群组重命名
+func (m *Message) IsRenameGroup() bool {
+	return m.IsSystem() && strings.Contains(m.Content, "修改群名为")
+}
+
 func (m *Message) IsSysNotice() bool {
 	return m.MsgType == 9999
 }
@@ -261,6 +299,59 @@ func (m *Message) GetFile() (*http.Response, error) {
 	return nil, errors.New("unsupported type")
 }
 
+// GetPicture 获取图片消息的响应
+func (m *Message) GetPicture() (*http.Response, error) {
+	if !(m.IsPicture() || m.IsEmoticon()) {
+		return nil, errors.New("picture message required")
+	}
+	return m.Bot.Caller.Client.WebWxGetMsgImg(m, m.Bot.Storage.LoginInfo)
+}
+
+// GetVoice 获取录音消息的响应
+func (m *Message) GetVoice() (*http.Response, error) {
+	if !m.IsVoice() {
+		return nil, errors.New("voice message required")
+	}
+	return m.Bot.Caller.Client.WebWxGetVoice(m, m.Bot.Storage.LoginInfo)
+}
+
+// GetVideo 获取视频消息的响应
+func (m *Message) GetVideo() (*http.Response, error) {
+	if !m.IsVideo() {
+		return nil, errors.New("video message required")
+	}
+	return m.Bot.Caller.Client.WebWxGetVideo(m, m.Bot.Storage.LoginInfo)
+}
+
+// GetMedia 获取媒体消息的响应
+func (m *Message) GetMedia() (*http.Response, error) {
+	if !m.IsMedia() {
+		return nil, errors.New("media message required")
+	}
+	return m.Bot.Caller.Client.WebWxGetMedia(m, m.Bot.Storage.LoginInfo)
+}
+
+// SaveFile 保存文件到指定的 io.Writer
+func (m *Message) SaveFile(writer io.Writer) error {
+	resp, err := m.GetFile()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, err = io.Copy(writer, resp.Body)
+	return err
+}
+
+// SaveFileToLocal 保存文件到本地
+func (m *Message) SaveFileToLocal(filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	return m.SaveFile(file)
+}
+
 // Card 获取card类型
 func (m *Message) Card() (*Card, error) {
 	if !m.IsCard() {
@@ -292,15 +383,19 @@ func (m *Message) RevokeMsg() (*RevokeMsg, error) {
 }
 
 // Agree 同意好友的请求
-func (m *Message) Agree(verifyContents ...string) error {
+func (m *Message) Agree(verifyContents ...string) (*Friend, error) {
 	if !m.IsFriendAdd() {
-		return fmt.Errorf("friend add message required")
+		return nil, errors.New("friend add message required")
 	}
-	var builder strings.Builder
-	for _, v := range verifyContents {
-		builder.WriteString(v)
+	err := m.Bot.Caller.WebWxVerifyUser(m.Bot.Storage, m.RecommendInfo, strings.Join(verifyContents, ""))
+	if err != nil {
+		return nil, err
 	}
-	return m.Bot.Caller.WebWxVerifyUser(m.Bot.Storage, m.RecommendInfo, builder.String())
+	friend := newFriend(m.RecommendInfo.UserName, m.Bot.self)
+	if err = friend.Detail(); err != nil {
+		return nil, err
+	}
+	return friend, nil
 }
 
 // AsRead 将消息设置为已读
@@ -348,25 +443,39 @@ func (m *Message) Get(key string) (value interface{}, exist bool) {
 // 消息初始化,根据不同的消息作出不同的处理
 func (m *Message) init(bot *Bot) {
 	m.Bot = bot
-
+	raw, _ := json.Marshal(m)
+	m.Raw = raw
+	m.RawContent = m.Content
 	// 如果是群消息
 	if m.IsSendByGroup() {
-		// 将Username和正文分开
-		data := strings.Split(m.Content, ":<br/>")
-		m.Content = strings.Join(data[1:], "")
-		m.senderInGroupUserName = data[0]
-		receiver, err := m.Receiver()
-		if err == nil {
-			displayName := receiver.DisplayName
-			if displayName == "" {
-				displayName = receiver.NickName
-			}
-			// 判断是不是@消息
-			atFlag := "@" + displayName
-			index := len(atFlag) + 1 + 1
-			if strings.HasPrefix(m.Content, atFlag) && unicode.IsSpace(rune(m.Content[index])) {
-				m.IsAt = true
-				m.Content = m.Content[index+1:]
+		if !m.IsSystem() {
+			// 将Username和正文分开
+			if !m.IsSendBySelf() {
+				data := strings.Split(m.Content, ":<br/>")
+				m.Content = strings.Join(data[1:], "")
+				m.senderInGroupUserName = data[0]
+				if strings.Contains(m.Content, "@") {
+					sender, err := m.Sender()
+					if err == nil {
+						receiver := sender.MemberList.SearchByUserName(1, m.ToUserName)
+						if receiver != nil {
+							displayName := receiver.First().DisplayName
+							if displayName == "" {
+								displayName = receiver.First().NickName
+							}
+							var atFlag string
+							if strings.Contains(m.Content, "\u2005") {
+								atFlag = "@" + displayName + "\u2005"
+							} else {
+								atFlag = "@" + displayName + " "
+							}
+							m.isAt = strings.Contains(m.Content, atFlag) || strings.HasSuffix(m.Content, atFlag)
+						}
+					}
+				}
+			} else {
+				// 这块不严谨，但是只能这么干了
+				m.isAt = strings.Contains(m.Content, "@") || strings.Contains(m.Content, "\u2005")
 			}
 		}
 	}
@@ -458,7 +567,7 @@ type Card struct {
 // FriendAddMessage 好友添加消息信息内容
 type FriendAddMessage struct {
 	XMLName           xml.Name `xml:"msg"`
-	Shortpy           int      `xml:"shortpy,attr"`
+	Shortpy           string   `xml:"shortpy,attr"`
 	ImageStatus       int      `xml:"imagestatus,attr"`
 	Scene             int      `xml:"scene,attr"`
 	PerCard           int      `xml:"percard,attr"`
@@ -533,13 +642,27 @@ func (s *SentMessage) CanRevoke() bool {
 }
 
 // ForwardToFriends 转发该消息给好友
+// 该方法会阻塞直到所有好友都接收到消息
+// 这里为了兼容以前的版本，默认休眠0.5秒，如果需要更快的速度，可以使用 SentMessage.ForwardToFriendsWithDelay
 func (s *SentMessage) ForwardToFriends(friends ...*Friend) error {
-	return s.Self.ForwardMessageToFriends(s, friends...)
+	return s.ForwardToFriendsWithDelay(time.Second/2, friends...)
+}
+
+// ForwardToFriendsWithDelay 转发该消息给好友，延迟指定时间
+func (s *SentMessage) ForwardToFriendsWithDelay(delay time.Duration, friends ...*Friend) error {
+	return s.Self.ForwardMessageToFriends(s, delay, friends...)
 }
 
 // ForwardToGroups 转发该消息给群组
+// 该方法会阻塞直到所有群组都接收到消息
+// 这里为了兼容以前的版本，默认休眠0.5秒，如果需要更快的速度，可以使用 SentMessage.ForwardToGroupsDelay
 func (s *SentMessage) ForwardToGroups(groups ...*Group) error {
-	return s.Self.ForwardMessageToGroups(s, groups...)
+	return s.ForwardToGroupsWithDelay(time.Second/2, groups...)
+}
+
+// ForwardToGroupsWithDelay 转发该消息给群组， 延迟指定时间
+func (s *SentMessage) ForwardToGroupsWithDelay(delay time.Duration, groups ...*Group) error {
+	return s.Self.ForwardMessageToGroups(s, delay, groups...)
 }
 
 type appmsg struct {
@@ -645,5 +768,35 @@ func (a AppMessageData) IsFile() bool {
 // IsComeFromGroup 判断消息是否来自群组
 // 可能是自己或者别的群员发送
 func (m *Message) IsComeFromGroup() bool {
-	return m.IsSendByGroup() || strings.HasPrefix(m.ToUserName, "@@")
+	return m.IsSendByGroup() || (strings.HasPrefix(m.ToUserName, "@@") && m.IsSendBySelf())
+}
+
+func (m *Message) String() string {
+	return fmt.Sprintf("<%s:%s>", m.MsgType, m.MsgId)
+}
+
+// IsAt 判断消息是否为@消息
+func (m *Message) IsAt() bool {
+	return m.isAt
+}
+
+// IsPaiYiPai 判断消息是否为拍一拍
+// 不要问我为什么取名为PaiYiPai，因为我也不知道取啥名字好
+func (m *Message) IsPaiYiPai() bool {
+	return m.IsSystem() && strings.Contains(m.Content, "拍了拍")
+}
+
+// IsJoinGroup 判断是否有人加入了群聊
+func (m *Message) IsJoinGroup() bool {
+	return m.IsSystem() && strings.Contains(m.Content, "加入了群聊") && m.IsSendByGroup()
+}
+
+// IsTickled 判断消息是否为拍一拍
+func (m *Message) IsTickled() bool {
+	return m.IsPaiYiPai()
+}
+
+// IsVoipInvite 判断消息是否为语音或视频通话邀请
+func (m *Message) IsVoipInvite() bool {
+	return m.MsgType == MsgTypeVoipInvite
 }

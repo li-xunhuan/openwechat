@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
+	"io"
 	"math/rand"
 	"mime/multipart"
 	"net/http"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -63,11 +65,11 @@ func GetFileContentType(file multipart.File) (string, error) {
 }
 
 func getFileExt(name string) string {
-	results := strings.Split(name, ".")
-	if len(results) == 1 {
-		return "undefined"
+	ext := filepath.Ext(name)
+	if len(ext) == 0 {
+		ext = "undefined"
 	}
-	return results[len(results)-1]
+	return strings.TrimPrefix(ext, ".")
 }
 
 const (
@@ -87,20 +89,12 @@ func getMessageType(filename string) string {
 	return doc
 }
 
-func scanXml(resp *http.Response, v interface{}) error {
-	var buffer bytes.Buffer
-	if _, err := buffer.ReadFrom(resp.Body); err != nil {
-		return err
-	}
-	return xml.Unmarshal(buffer.Bytes(), v)
+func scanXml(reader io.Reader, v interface{}) error {
+	return xml.NewDecoder(reader).Decode(v)
 }
 
-func scanJson(resp *http.Response, v interface{}) error {
-	var buffer bytes.Buffer
-	if _, err := buffer.ReadFrom(resp.Body); err != nil {
-		return err
-	}
-	return json.Unmarshal(buffer.Bytes(), v)
+func scanJson(reader io.Reader, v interface{}) error {
+	return json.NewDecoder(reader).Decode(v)
 }
 
 func stringToByte(s string) []byte {
